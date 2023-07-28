@@ -497,8 +497,8 @@ def edge_pruning(input_data, device):
                 + cutoff[data.edge_index[1][i].item()]
             ) / 100
 
-            # 0.9 a placeholder
-            if distances.item() > 0.9 * total_cutoff:
+            # 1.2 a placeholder
+            if distances.item() > 1.2 * total_cutoff:
                 data.edge_descriptor["distance"][i] = -1
                 data.edge_index[0][i] = -1
                 data.edge_index[1][i] = -1
