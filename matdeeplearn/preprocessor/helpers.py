@@ -9,13 +9,16 @@ from typing import Literal
 import ase
 import numpy as np
 import pandas
+import pandas as pd
 import torch
 import torch.nn.functional as F
 from ase import Atoms
+from mendeleev.fetch import fetch_table
 from torch_geometric.data.data import Data
 from torch_geometric.utils import add_self_loops, degree, dense_to_sparse
 from torch_scatter import scatter_min, segment_coo, segment_csr
 from torch_sparse import SparseTensor
+
 
 def calculate_edges_master(
     method: Literal["ase", "ocp", "mdl"],
@@ -47,13 +50,13 @@ def calculate_edges_master(
         assert (method == "ase" and all_neighbors) or (
             method == "ocp" and all_neighbors
         ), "OCP and ASE methods only support all_neighbors=True"
-        #if method == "ase":
+        # if method == "ase":
         #    raise Warning("ASE does not take into account n_neighbors")
 
     out = dict()
     neighbors = torch.empty(0)
     cell_offset_distances = torch.empty(0)
-    
+
     if torch.sum(cell) == 0:
         cell = None
         method = "mdl"
@@ -71,18 +74,24 @@ def calculate_edges_master(
 
         # get into correct shape for model stage
         edge_vec = edge_vec[edge_index[0], edge_index[1]]
-    
+
     elif method == "ase":
         edge_index, cell_offsets, edge_weights, edge_vec = calculate_edges_ase(
             all_neighbors, r, n_neighbors, structure_id, cell.squeeze(0), pos
         )
-    
+
     elif method == "ocp":
         # OCP requires a different format for the cell
         cell = cell.view(1, 3, 3)
-        
+
         edge_index, cell_offsets, neighbors = radius_graph_pbc(
-            r, n_neighbors, pos, cell, torch.tensor([len(pos)]), [True, True, True], offset_number
+            r,
+            n_neighbors,
+            pos,
+            cell,
+            torch.tensor([len(pos)]),
+            [True, True, True],
+            offset_number,
         )
 
         ocp_out = get_pbc_distances(
@@ -108,16 +117,17 @@ def calculate_edges_master(
 
     return out
 
+
 @contextlib.contextmanager
 def prof_ctx():
     """Primitive debug tool which allows profiling of PyTorch code"""
     with profile(
         activities=[ProfilerActivity.CUDA], record_shapes=True, profile_memory=True
     ) as prof:
-
         yield
 
     logging.debug(prof.key_averages().table(sort_by="cuda_memory_usage", row_limit=10))
+
 
 def argmax(arr: list[dict], key: str) -> int:
     """List of Dict argmax utility function
@@ -166,6 +176,7 @@ def get_mask(
 
     mask = torch.argwhere(cond1 & cond2).squeeze(1)
     return mask
+
 
 def threshold_sort(all_distances: torch.Tensor, r: float, n_neighbors: int):
     # A = all_distances.clone().detach()
@@ -268,6 +279,7 @@ def clean_up(data_list, attr_list):
         for attr in removable_attrs:
             delattr(data, attr)
 
+
 def get_pbc_cells(cell: torch.Tensor, offset_number: int, device: str = "cpu"):
     """
     Get the periodic boundary condition (PBC) offsets for a unit cell
@@ -287,6 +299,7 @@ def get_pbc_cells(cell: torch.Tensor, offset_number: int, device: str = "cpu"):
     # offsets = torch.cartesian_prod([_range, _range, _range]).to(device).type(torch.float)
     offsets = torch.tensor(offsets, device=device, dtype=torch.float)
     return offsets @ cell, offsets
+
 
 def get_distances_pbc(
     positions: torch.Tensor,
@@ -310,11 +323,11 @@ def get_distances_pbc(
         mic:        bool
                     minimum image convention
     """
-    
+
     # convert numpy array to torch tensors
     n_atoms = len(positions)
     n_cells = len(offsets[0])
-    
+
     pos1 = positions.view(-1, 1, 1, 3).expand(-1, n_atoms, n_cells, 3)
     pos2 = positions.view(1, -1, 1, 3).expand(n_atoms, -1, n_cells, 3)
     offsets = offsets.view(-1, n_cells, 3).expand(pos2.shape[0], n_cells, 3)
@@ -332,7 +345,6 @@ def get_distances_pbc(
     # get minimum
     min_atomic_distances, min_indices = torch.min(atomic_distances, dim=-1)
     expanded_min_indices = min_indices.clone().detach()
-    
 
     atom_rij = (pos1 - pos2).squeeze(2)
 
@@ -343,11 +355,11 @@ def get_distances_pbc(
 
     return min_atomic_distances, min_indices, atom_rij
 
+
 def get_distances(
     positions: torch.Tensor,
     device: str = "cpu",
 ):
-
     n_atoms = len(positions)
     pos1 = positions.view(-1, 1, 3).expand(-1, n_atoms, 3)
     pos2 = positions.view(1, -1, 3).expand(n_atoms, -1, 3)
@@ -358,9 +370,7 @@ def get_distances(
     return atomic_distances, atom_rij
 
 
-def get_cutoff_distance_matrix(
-    pos, cell, r, n_neighbors, offset_number=3
-):
+def get_cutoff_distance_matrix(pos, cell, r, n_neighbors, offset_number=3):
     """
     get the distance matrix
     TODO: need to tune this for elongated structures
@@ -381,23 +391,25 @@ def get_cutoff_distance_matrix(
             max number of neighbors to be considered
     """
     device = pos.device
-    
+
     if cell != None:
         cells, cell_coors = get_pbc_cells(cell, offset_number, device=device)
-        distance_matrix, min_indices, atom_rij = get_distances_pbc(pos, cells, device=device)
-    
+        distance_matrix, min_indices, atom_rij = get_distances_pbc(
+            pos, cells, device=device
+        )
+
         cutoff_distance_matrix = threshold_sort(distance_matrix, r, n_neighbors)
-    
+
         # if image_selfloop:
         #     # output of threshold sort has diagonal == 0
         #     # fill in the original values
         #     self_loop_diag = distance_matrix.diagonal()
         #     cutoff_distance_matrix.diagonal().copy_(self_loop_diag)
-    
+
         all_cell_offsets = cell_coors[torch.flatten(min_indices)]
         all_cell_offsets = all_cell_offsets.view(len(pos), -1, 3)
         # cell_offsets = all_cell_offsets[cutoff_distance_matrix != 0]
-    
+
         # self loops will always have cell of (0,0,0)
         # N: no of selfloops; M: no of non selfloop edges
         # self loops are the last N edge_index pairs
@@ -407,11 +419,11 @@ def get_cutoff_distance_matrix(
         # get cells for edges except for self loops
         cell_offsets[:n_edges, :] = all_cell_offsets[cutoff_distance_matrix != 0]
         cell_offsets = cell_offsets[:n_edges]
-        
+
     elif cell == None:
-        distance_matrix, atom_rij = get_distances(pos, device=device)   
+        distance_matrix, atom_rij = get_distances(pos, device=device)
         cutoff_distance_matrix = threshold_sort(distance_matrix, r, n_neighbors)
-        cell_offsets = torch.zeros((1,3))
+        cell_offsets = torch.zeros((1, 3))
 
     return cutoff_distance_matrix, cell_offsets, atom_rij
 
@@ -462,11 +474,51 @@ def load_node_representation(node_representation="onehot"):
     return loaded_rep
 
 
+def reverse_onehot(atom):
+    # Atom is onehot encoded
+    return torch.argmax(atom).item()
+
+
+def edge_pruning(input_data, device):
+    # Get covalent radius list
+    cov_rad = []
+    # 100 is # of elements
+    for i in range(100):
+        ptable = fetch_table("elements")
+        cov_rad.append(ptable["covalent_radius_cordero"].to_numpy()[i].astype(float))
+
+    for data in input_data:
+        cutoff = [cov_rad[reverse_onehot(atoms)] for atoms in data.x]
+
+        for i, distances in enumerate(data.edge_descriptor["distance"]):
+            # picometer -> angstrom
+            total_cutoff = (
+                cutoff[data.edge_index[0][i].item()]
+                + cutoff[data.edge_index[1][i].item()]
+            ) / 100
+
+            # 0.9 a placeholder
+            if distances.item() > 0.9 * total_cutoff:
+                data.edge_descriptor["distance"][i] = -1
+                data.edge_index[0][i] = -1
+                data.edge_index[1][i] = -1
+
+        zero = data.edge_index[0]
+        one = data.edge_index[1]
+        zero = zero[zero != -1]
+        one = one[one != -1]
+
+        data.edge_index = torch.stack((zero, one))
+        data.edge_descriptor["distance"] = data.edge_descriptor["distance"][
+            data.edge_descriptor["distance"] != -1
+        ]
+
+
 def generate_node_features(input_data, n_neighbors, device, use_degree=False):
     node_reps = load_node_representation()
     node_reps = torch.from_numpy(node_reps).to(device)
     n_elements, n_features = node_reps.shape
-    
+
     if isinstance(input_data, Data):
         input_data.x = node_reps[input_data.z - 1].view(-1, n_features)
         if use_degree:
@@ -477,8 +529,8 @@ def generate_node_features(input_data, n_neighbors, device, use_degree=False):
         # minus 1 as the reps are 0-indexed but atomic number starts from 1
         data.x = node_reps[data.z - 1].view(-1, n_features).float()
 
-    #for i, data in enumerate(input_data):
-        #input_data[i] = one_hot_degree(data, n_neighbors)
+    # for i, data in enumerate(input_data):
+    # input_data[i] = one_hot_degree(data, n_neighbors)
 
 
 def generate_edge_features(input_data, edge_steps, r, device):
@@ -487,11 +539,15 @@ def generate_edge_features(input_data, edge_steps, r, device):
     if isinstance(input_data, Data):
         input_data = [input_data]
 
+    edge_pruning(input_data, device)
+
     normalize_edge_cutoff(input_data, "distance", r)
     for i, data in enumerate(input_data):
         input_data[i].edge_attr = distance_gaussian(
             input_data[i].edge_descriptor["distance"]
         )
+
+
 def tripletsOld(
     edge_index,
     num_nodes,
@@ -499,8 +555,9 @@ def tripletsOld(
     row, col = edge_index  # j->i
 
     value = torch.arange(row.size(0), device=row.device)
-    adj_t = SparseTensor(row=col, col=row, value=value,
-                         sparse_sizes=(num_nodes, num_nodes))
+    adj_t = SparseTensor(
+        row=col, col=row, value=value, sparse_sizes=(num_nodes, num_nodes)
+    )
     adj_t_row = adj_t[row]
     num_triplets = adj_t_row.set_value(None).sum(dim=1).to(torch.long)
 
@@ -515,7 +572,8 @@ def tripletsOld(
     idx_kj = adj_t_row.storage.value()[mask]
     idx_ji = adj_t_row.storage.row()[mask]
 
-    return col, row, idx_i, idx_j, idx_k, idx_kj, idx_ji        
+    return col, row, idx_i, idx_j, idx_k, idx_kj, idx_ji
+
 
 def triplets(edge_index, cell_offsets, num_nodes):
     """
@@ -561,10 +619,8 @@ def compute_bond_angles(
     Taken from the DimeNet implementation on OCP
     """
     # Calculate triplets
-    if (offsets is None):
-        _, _, idx_i, idx_j, idx_k, idx_kj, idx_ji = tripletsOld(
-        edge_index, num_nodes
-        )
+    if offsets is None:
+        _, _, idx_i, idx_j, idx_k, idx_kj, idx_ji = tripletsOld(edge_index, num_nodes)
     else:
         idx_i, idx_j, idx_k, idx_kj, idx_ji = triplets(
             edge_index, offsets.to(device=edge_index.device), num_nodes
@@ -574,7 +630,7 @@ def compute_bond_angles(
     pos_i = pos[idx_i]
     pos_j = pos[idx_j]
 
-    if (offsets is not None):
+    if offsets is not None:
         offsets = offsets.to(pos.device)
         pos_ji, pos_kj = (
             pos[idx_j] - pos_i + offsets[idx_ji],
@@ -592,7 +648,8 @@ def compute_bond_angles(
     angle = torch.atan2(b, a)
 
     return angle, idx_kj, idx_ji
-    
+
+
 def get_pbc_distances(
     pos,
     edge_index,
@@ -645,6 +702,7 @@ def get_pbc_distances(
         out["offsets"] = offsets[nonzero_idx]
 
     return out
+
 
 def get_max_neighbors_mask(natoms, index, atom_distance, max_num_neighbors_threshold):
     """
@@ -720,7 +778,8 @@ def get_max_neighbors_mask(natoms, index, atom_distance, max_num_neighbors_thres
     mask_num_neighbors.index_fill_(0, index_sort, True)
 
     return mask_num_neighbors, num_neighbors_image
-    
+
+
 def radius_graph_pbc(
     radius: float,
     max_num_neighbors_threshold: int,
@@ -822,9 +881,13 @@ def radius_graph_pbc(
     # if the required repetitions are very different between images
     # (which they usually are). Changing this to sparse (scatter) operations
     # might be worth the effort if this function becomes a bottleneck.
-    #max_rep = [rep_a1.max(), rep_a2.max(), rep_a3.max()]
-    max_rep = [min(rep_a1.max().detach(), offset_number), min(rep_a2.max().detach(), offset_number), min(rep_a3.max().detach(), offset_number)]
-    
+    # max_rep = [rep_a1.max(), rep_a2.max(), rep_a3.max()]
+    max_rep = [
+        min(rep_a1.max().detach(), offset_number),
+        min(rep_a2.max().detach(), offset_number),
+        min(rep_a3.max().detach(), offset_number),
+    ]
+
     # Tensor of unit cells
     cells_per_dim = [
         torch.arange(-rep, rep + 1, device=device, dtype=torch.float) for rep in max_rep
@@ -886,6 +949,7 @@ def radius_graph_pbc(
     edge_index = torch.stack((index2, index1))
 
     return edge_index, unit_cell, num_neighbors_image
+
 
 def calculate_edges_ase(
     all_neighbors: bool,
@@ -971,5 +1035,3 @@ def calculate_edges_ase(
     edge_index = torch.stack([first_idex, second_idex], dim=0)
 
     return edge_index, cell_offsets, edge_weights, edge_vec
-
-
