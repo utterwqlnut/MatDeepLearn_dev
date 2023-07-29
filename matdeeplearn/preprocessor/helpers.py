@@ -474,39 +474,32 @@ def load_node_representation(node_representation="onehot"):
     return loaded_rep
 
 
-def reverse_onehot(atom):
-    # Atom is onehot encoded
-    return torch.argmax(atom).item()
-
-
 def edge_pruning(input_data, device):
     # Get covalent radius list
     cov_rad = []
     # 100 is # of elements
+    ptable = fetch_table("elements")
     for i in range(100):
-        ptable = fetch_table("elements")
         cov_rad.append(ptable["covalent_radius_cordero"].to_numpy()[i].astype(float))
 
     for data in input_data:
-        cutoff = [cov_rad[reverse_onehot(atoms)] for atoms in data.x]
-
-        for i, distances in enumerate(data.edge_descriptor["distance"]):
-            # picometer -> angstrom
-            total_cutoff = (
-                cutoff[data.edge_index[0][i].item()]
-                + cutoff[data.edge_index[1][i].item()]
-            ) / 100
-
-            # 1.2 a placeholder
-            if distances.item() > 1.2 * total_cutoff:
-                data.edge_descriptor["distance"][i] = -1
-                data.edge_index[0][i] = -1
-                data.edge_index[1][i] = -1
+        cutoff = [cov_rad[atom - 1] for atom in data.z]
 
         zero = data.edge_index[0]
         one = data.edge_index[1]
-        zero = zero[zero != -1]
-        one = one[one != -1]
+
+        total_cutoff = torch.tensor(
+            list(map(lambda x, y: 1.2 * (cutoff[x] + cutoff[y]) / 100, zero, one))
+        )
+
+        data.edge_descriptor["distance"] = torch.where(
+            torch.greater(data.edge_descriptor["distance"], total_cutoff),
+            -1,
+            data.edge_descriptor["distance"],
+        )
+
+        zero = zero[data.edge_descriptor["distance"] != -1]
+        one = one[data.edge_descriptor["distance"] != -1]
 
         data.edge_index = torch.stack((zero, one))
         data.edge_descriptor["distance"] = data.edge_descriptor["distance"][
