@@ -507,6 +507,28 @@ def edge_pruning(input_data, device):
         ]
 
 
+def chem_edge_features(input_data, device):
+    cov_rad = []
+    ptable = fetch_table("elements")
+
+    for i in range(100):
+        cov_rad.append(ptable["covalent_radius_cordero"].to_numpy()[i].astype(float))
+
+    for data in input_data:
+        radii = [cov_rad[atom - 1] for atom in data.z]
+
+        zero = data.edge_index[0]
+        one = data.edge_index[1]
+
+        cov_rad_sum = torch.tensor(
+            list(map(lambda x, y: (radii[x] + radii[y]) / 100, zero, one))
+        )
+
+        data.edge_descriptor["distance"] = torch.div(
+            data.edge_descriptor["distance"], cov_rad_sum
+        ).to(torch.float32)
+
+
 def generate_node_features(input_data, n_neighbors, device, use_degree=False):
     node_reps = load_node_representation()
     node_reps = torch.from_numpy(node_reps).to(device)
