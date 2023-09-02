@@ -474,7 +474,10 @@ def load_node_representation(node_representation="onehot"):
     return loaded_rep
 
 
-def edge_pruning(input_data, device):
+def label_distances_cov_rad(input_data, device):
+    """
+    Marks edges > cov_rad*thresh as -1
+    """
     # Get covalent radius list
     cov_rad = []
     # 100 is # of elements
@@ -498,6 +501,42 @@ def edge_pruning(input_data, device):
             data.edge_descriptor["distance"],
         )
 
+
+def generate_short_list(input_data, device):
+    """
+    Marks edges > cov_rad*thresh as -1
+    """
+    # Get covalent radius list
+    cov_rad = []
+    # 100 is # of elements
+    ptable = fetch_table("elements")
+    for i in range(100):
+        cov_rad.append(ptable["covalent_radius_cordero"].to_numpy()[i].astype(float))
+
+    for data in input_data:
+        cutoff = [cov_rad[atom - 1] for atom in data.z]
+
+        zero = data.edge_index[0]
+        one = data.edge_index[1]
+
+        total_cutoff = torch.tensor(
+            list(map(lambda x, y: 1.2 * (cutoff[x] + cutoff[y]) / 100, zero, one))
+        )
+
+        data.short_list = torch.where(
+            torch.greater(data.edge_descriptor["distance"], total_cutoff),
+        )[0]
+
+
+def edge_pruning(input_data, device):
+    """
+    Prunes edges < cov_rad*thresh
+    """
+    label_distances_cov_rad(input_data, device)
+    for data in input_data:
+        zero = data.edge_index[0]
+        one = data.edge_index[1]
+
         zero = zero[data.edge_descriptor["distance"] != -1]
         one = one[data.edge_descriptor["distance"] != -1]
 
@@ -505,6 +544,45 @@ def edge_pruning(input_data, device):
         data.edge_descriptor["distance"] = data.edge_descriptor["distance"][
             data.edge_descriptor["distance"] != -1
         ]
+
+
+def generate_split_edge_features(input_data, edge_steps, r, device):
+    """
+    Splits edges into long and small
+    """
+    distance_gaussian = GaussianSmearing(0, 1, edge_steps, 0.2, device=device)
+
+    if isinstance(input_data, Data):
+        input_data = [input_data]
+
+    label_distances_cov_rad(input_data, device)
+    for data in input_data:
+        zero = data.edge_index[0]
+        one = data.edge_index[1]
+
+        short_zero = zero[data.edge_descriptor["distance"] != -1]
+        short_one = one[data.edge_descriptor["distance"] != -1]
+        long_zero = zero[data.edge_descriptor["distance"] == -1]
+        long_one = one[data.edge_descriptor["distance"] == -1]
+
+        data.short_edge_index = torch.stack((short_zero, short_one))
+        data.long_edge_index = torch.stack((long_zero, long_one))
+
+        data.edge_descriptor["short_distance"] = data.edge_descriptor["distance"][
+            data.edge_descriptor["distance"] != -1
+        ]
+        data.edge_descriptor["long_distance"] = data.edge_descriptor["distance"][
+            data.edge_descriptor["distance"] == -1
+        ]
+
+    normalize_edge_cutoff(input_data, "short_distance", r)
+    normalize_edge_cutoff(input_data, "long_distance", r)
+
+    for i, data in enumerate(input_data):
+        input_data[i].edge_attr = (
+            distance_gaussian(input_data[i].edge_descriptor["short_distance"]),
+            distance_gaussian(input_data[i].edge_descriptor["short_distance"]),
+        )
 
 
 def chem_edge_features(input_data, device):
