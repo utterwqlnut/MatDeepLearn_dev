@@ -579,9 +579,12 @@ def generate_split_edge_features(input_data, edge_steps, r, device):
     normalize_edge_cutoff(input_data, "long_distance", r)
 
     for i, data in enumerate(input_data):
-        input_data[i].edge_attr = (
-            distance_gaussian(input_data[i].edge_descriptor["short_distance"]),
-            distance_gaussian(input_data[i].edge_descriptor["short_distance"]),
+        input_data[i].long_edge_attr = distance_gaussian(
+            input_data[i].edge_descriptor["long_distance"]
+        )
+
+        input_data[i].short_edge_attr = distance_gaussian(
+            input_data[i].edge_descriptor["short_distance"]
         )
 
 
