@@ -522,10 +522,15 @@ def generate_short_list(input_data, device):
         total_cutoff = torch.tensor(
             list(map(lambda x, y: 1.2 * (cutoff[x] + cutoff[y]) / 100, zero, one))
         )
+        zeros = torch.zeros(data.edge_descriptor["distance"].shape)
+        # instead save mask of below cutoff
 
-        data.short_list = torch.where(
-            torch.greater(data.edge_descriptor["distance"], total_cutoff),
-        )[0]
+        data.mask1 = torch.where(
+            torch.less(data.edge_descriptor["distance"], total_cutoff), 1, zeros
+        )
+        data.mask2 = torch.where(
+            torch.greater(data.edge_descriptor["distance"], total_cutoff), 1, zeros
+        ).to(torch.long)
 
 
 def edge_pruning(input_data, device):
@@ -555,24 +560,36 @@ def generate_split_edge_features(input_data, edge_steps, r, device):
     if isinstance(input_data, Data):
         input_data = [input_data]
 
-    label_distances_cov_rad(input_data, device)
+    # Get covalent radius list
+    cov_rad = []
+    # 100 is # of elements
+    ptable = fetch_table("elements")
+
+    for i in range(100):
+        cov_rad.append(ptable["covalent_radius_cordero"].to_numpy()[i].astype(float))
+
     for data in input_data:
         zero = data.edge_index[0]
         one = data.edge_index[1]
 
-        short_zero = zero[data.edge_descriptor["distance"] != -1]
-        short_one = one[data.edge_descriptor["distance"] != -1]
-        long_zero = zero[data.edge_descriptor["distance"] == -1]
-        long_one = one[data.edge_descriptor["distance"] == -1]
+        cutoff = [cov_rad[atom - 1] for atom in data.z]
+        total_cutoff = torch.tensor(
+            list(map(lambda x, y: 1.2 * (cutoff[x] + cutoff[y]) / 100, zero, one))
+        )
+
+        short_zero = zero[torch.less(data.edge_descriptor["distance"], total_cutoff)]
+        short_one = one[torch.less(data.edge_descriptor["distance"], total_cutoff)]
+        long_zero = zero[torch.greater(data.edge_descriptor["distance"], total_cutoff)]
+        long_one = one[torch.greater(data.edge_descriptor["distance"], total_cutoff)]
 
         data.short_edge_index = torch.stack((short_zero, short_one))
         data.long_edge_index = torch.stack((long_zero, long_one))
 
         data.edge_descriptor["short_distance"] = data.edge_descriptor["distance"][
-            data.edge_descriptor["distance"] != -1
+            torch.less(data.edge_descriptor["distance"], total_cutoff)
         ]
         data.edge_descriptor["long_distance"] = data.edge_descriptor["distance"][
-            data.edge_descriptor["distance"] == -1
+            torch.greater(data.edge_descriptor["distance"], total_cutoff)
         ]
 
     normalize_edge_cutoff(input_data, "short_distance", r)
@@ -636,7 +653,7 @@ def generate_edge_features(input_data, edge_steps, r, device):
         input_data = [input_data]
 
     edge_pruning(input_data, device)
-
+    generate_short_list(input_data, device)
     normalize_edge_cutoff(input_data, "distance", r)
     for i, data in enumerate(input_data):
         input_data[i].edge_attr = distance_gaussian(

@@ -56,8 +56,6 @@ class DiGNN(BaseModel):
         self.edge_dim = edge_dim
         self.output_dim = output_dim
         self.dropout_rate = dropout_rate
-        self.gradient = False
-        self.otf_edge = False
 
         self.distance_expansion = GaussianSmearing(
             0.0, self.cutoff_radius, self.edge_steps
@@ -150,9 +148,9 @@ class DiGNN(BaseModel):
     def _forward(self, data):
         out1 = self.cgcnn_short(data)["output"]
         out2 = self.cgcnn_long(data)["output"]
-        out = torch.cat((out1, out2))
-        data.batch = data.batch.repeat_interleave(2)
-
+        out = out2  # torch.cat((out1, out2))
+        # data.batch = data.batch.repeat_interleave(2)
+        # print(out)
         if self.prediction_level == "graph":
             if self.pool_order == "early":
                 if self.pool == "set2set":
@@ -261,4 +259,5 @@ class LongShortCGCNN(CGCNN):
         else:
             data.edge_attr = data.short_edge_attr
             data.edge_index = data.short_edge_index
+
         return super(LongShortCGCNN, self).forward(data)

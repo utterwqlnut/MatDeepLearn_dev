@@ -503,7 +503,7 @@ class DataProcessor:
 
         if self.preprocess_edge_features == True:
             logging.info("Generating edge features...")
-            generate_split_edge_features(
+            generate_edge_features(
                 data_list, self.edge_steps, self.r, device=self.device
             )
 
