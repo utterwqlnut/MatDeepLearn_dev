@@ -530,7 +530,7 @@ def generate_short_list(input_data, device):
         )
         data.mask2 = torch.where(
             torch.greater(data.edge_descriptor["distance"], total_cutoff), 1, zeros
-        ).to(torch.long)
+        ).to(torch.bool)
 
 
 def edge_pruning(input_data, device):

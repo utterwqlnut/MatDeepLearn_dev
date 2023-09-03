@@ -62,7 +62,7 @@ class DropGNN(CGCNN):
 
     def forward(self, data):
         # CGCNN but drop some short dist edges
-        data.mask1 = self.dropout(data.mask1).to(torch.long)
+        data.mask1 = self.dropout(data.mask1).to(torch.bool)
         mask = (data.mask1) | (data.mask2)
 
         zero = data.edge_index[0]
