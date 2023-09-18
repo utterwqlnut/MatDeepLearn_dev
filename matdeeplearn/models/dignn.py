@@ -29,7 +29,8 @@ class DiGNN(BaseModel):
         dim1=64,
         dim2=64,
         pre_fc_count=1,
-        gc_count=3,
+        short_gc_count=3,
+        long_gc_count=3,
         post_fc_count=1,
         pool="global_mean_pool",
         pool_order="early",
@@ -50,7 +51,8 @@ class DiGNN(BaseModel):
         self.pre_fc_count = pre_fc_count
         self.dim1 = dim1
         self.dim2 = dim2
-        self.gc_count = gc_count
+        self.short_gc_count = short_gc_count
+        self.long_gc_count = long_gc_count
         self.post_fc_count = post_fc_count
         self.node_dim = node_dim
         self.edge_dim = edge_dim
@@ -61,49 +63,15 @@ class DiGNN(BaseModel):
             0.0, self.cutoff_radius, self.edge_steps
         )
 
-        self.cgcnn_short = LongShortCGCNN(
-            node_dim,
-            edge_dim,
-            output_dim,
-            long=True,
-            dim1=self.dim1,
-            dim2=self.dim2,
-            pre_fc_count=self.pre_fc_count,
-            gc_count=self.gc_count,
-            post_fc_count=self.post_fc_count,
-            pool=self.pool,
-            pool_order=self.pool_order,
-            batch_norm=self.batch_norm,
-            batch_track_stats=self.batch_track_stats,
-            act=self.act,
-            dropout_rate=self.dropout_rate,
-            **kwargs,
-        )
-        self.cgcnn_long = LongShortCGCNN(
-            node_dim,
-            edge_dim,
-            output_dim,
-            long=False,
-            dim1=self.dim1,
-            dim2=self.dim2,
-            pre_fc_count=self.pre_fc_count,
-            gc_count=self.gc_count,
-            post_fc_count=self.post_fc_count,
-            pool=self.pool,
-            pool_order=self.pool_order,
-            batch_norm=self.batch_norm,
-            batch_track_stats=self.batch_track_stats,
-            act=self.act,
-            dropout_rate=self.dropout_rate,
-            **kwargs,
-        )
-
-        assert gc_count > 0, "Need at least 1 GC layer"
+        assert short_gc_count > 0, "Need at least 1 Short GC Layer"
+        assert long_gc_count > 0, "Need at least 1 Long GC Layer"
         if pre_fc_count == 0:
             self.gc_dim, self.post_fc_dim = self.node_dim, self.node_dim
         else:
             self.gc_dim, self.post_fc_dim = dim1, dim1
 
+        self.pre_lin_list = self._setup_pre_gnn_layers()
+        self.conv_list, self.bn_list = self._setup_gnn_layers()
         self.post_lin_list, self.lin_out = self._setup_post_gnn_layers()
 
         if self.pool_order == "early" and self.pool == "set2set":
@@ -116,6 +84,36 @@ class DiGNN(BaseModel):
     @property
     def target_attr(self):
         return "y"
+
+    def _setup_pre_gnn_layers(self):
+        """Sets up pre-GNN dense layers (NOTE: in v0.1 this is always set to 1 layer)."""
+        pre_lin_list = torch.nn.ModuleList()
+        if self.pre_fc_count > 0:
+            pre_lin_list = torch.nn.ModuleList()
+            for i in range(self.pre_fc_count):
+                if i == 0:
+                    lin = torch.nn.Linear(self.node_dim, self.dim1)
+                else:
+                    lin = torch.nn.Linear(self.dim1, self.dim1)
+                pre_lin_list.append(lin)
+
+        return pre_lin_list
+
+    def _setup_gnn_layers(self):
+        """Sets up GNN layers."""
+        conv_list = torch.nn.ModuleList()
+        bn_list = torch.nn.ModuleList()
+        for i in range(self.short_gc_count + self.long_gc_count):
+            conv = CGConv(self.gc_dim, self.edge_dim, aggr="mean", batch_norm=False)
+            conv_list.append(conv)
+            # Track running stats set to false can prevent some instabilities; this causes other issues with different val/test performance from loader size?
+            if self.batch_norm:
+                bn = BatchNorm1d(
+                    self.gc_dim, track_running_stats=self.batch_track_stats
+                )
+                bn_list.append(bn)
+
+        return conv_list, bn_list
 
     def _setup_post_gnn_layers(self):
         """Sets up post-GNN dense layers (NOTE: in v0.1 there was a minimum of 2 dense layers, and fc_count(now post_fc_count) added to this number. In the current version, the minimum is zero)."""
@@ -146,11 +144,42 @@ class DiGNN(BaseModel):
 
     @conditional_grad(torch.enable_grad())
     def _forward(self, data):
-        out1 = self.cgcnn_short(data)["output"]
-        out2 = self.cgcnn_long(data)["output"]
-        out = out2  # torch.cat((out1, out2))
-        # data.batch = data.batch.repeat_interleave(2)
-        # print(out)
+        for i in range(0, len(self.pre_lin_list)):
+            if i == 0:
+                out = self.pre_lin_list[i](data.x)
+                out = getattr(F, self.act)(out)
+            else:
+                out = self.pre_lin_list[i](out)
+                out = getattr(F, self.act)(out)
+
+        # GNN layers
+        for i in range(0, self.short_gc_count + self.long_gc_count):
+            if (
+                i % 2 == 0
+                and i // 2 < self.short_gc_count
+                or i // 2 >= self.long_gc_count
+            ):
+                data.edge_index = data.short_edge_index
+                data.edge_attr = data.short_edge_attr
+            else:
+                data.edge_index = data.long_edge_index
+                data.edge_attr = data.long_edge_attr
+
+            if len(self.pre_lin_list) == 0 and i == 0:
+                if self.batch_norm:
+                    out = self.conv_list[i](data.x, data.edge_index, data.edge_attr)
+                    out = self.bn_list[i](out)
+                else:
+                    out = self.conv_list[i](data.x, data.edge_index, data.edge_attr)
+            else:
+                if self.batch_norm:
+                    out = self.conv_list[i](out, data.edge_index, data.edge_attr)
+                    out = self.bn_list[i](out)
+                else:
+                    out = self.conv_list[i](out, data.edge_index, data.edge_attr)
+                    # out = getattr(F, self.act)(out)
+            out = F.dropout(out, p=self.dropout_rate, training=self.training)
+
         if self.prediction_level == "graph":
             if self.pool_order == "early":
                 if self.pool == "set2set":
@@ -182,7 +211,6 @@ class DiGNN(BaseModel):
         return out
 
     def forward(self, data):
-
         output = {}
         out = self._forward(data)
         output["output"] = out
@@ -210,54 +238,3 @@ class DiGNN(BaseModel):
             output["cell_grad"] = None
 
         return output
-
-
-class LongShortCGCNN(CGCNN):
-    def __init__(
-        self,
-        node_dim,
-        edge_dim,
-        output_dim,
-        long,
-        dim1=64,
-        dim2=64,
-        pre_fc_count=1,
-        gc_count=3,
-        post_fc_count=1,
-        pool="global_mean_pool",
-        pool_order="early",
-        batch_norm=True,
-        batch_track_stats=True,
-        act="relu",
-        dropout_rate=0.0,
-        **kwargs
-    ):
-        super(LongShortCGCNN, self).__init__(
-            node_dim,
-            edge_dim,
-            output_dim,
-            dim1,
-            dim2,
-            pre_fc_count,
-            gc_count,
-            post_fc_count,
-            pool,
-            pool_order,
-            batch_norm,
-            batch_track_stats,
-            act,
-            dropout_rate,
-            **kwargs,
-        )
-        self.long = long
-        self.prediction_level = "n/a"
-
-    def forward(self, data):
-        if self.long:
-            data.edge_attr = data.long_edge_attr
-            data.edge_index = data.long_edge_index
-        else:
-            data.edge_attr = data.short_edge_attr
-            data.edge_index = data.short_edge_index
-
-        return super(LongShortCGCNN, self).forward(data)
